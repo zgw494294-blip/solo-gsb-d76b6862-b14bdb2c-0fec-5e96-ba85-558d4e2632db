@@ -11,11 +11,18 @@
 逐行按 `ROUND_HALF_UP` 取整数分合计写入 `TDS01`；生成的报文不超过 64 KiB
 且保证可通过 `/v1/verify`。
 
+另提供 `POST /v1/split-810`：接收**单份 ISA/IEA、单组 GS/GE 内含 1～50 个
+连续 ST…SE** 的 ASCII 004010 X12 810 交换报文（≤1 MiB），按 ISA 固定位置读取
+分隔符并校验批量外壳（控制号配对、`GE01` 等于交易集数、`IEA01=1`、各
+`ST01=810` 且 `ST02` 不重复）；为每个交易集保留原业务段与控制号，重写
+`SE01`/`GE01=1` 重建为单张报文，并用 `/v1/verify` 规则逐张核验。任一失败
+整批 `422`（指出原报文段序号、交易集序号与错误码，不返回部分结果）；成功
+按原顺序返回各交易集的 `ST02`、发票号与各自可再提交 `/v1/verify` 的
+`edi_text`（每份仍 ≤64 KiB）。
+
 另提供 `POST /v1/reconcile`：给定一张采购单，对 1～50 份发票报文按输入顺序
 逐张核销（逐张核验、行号/单价比对、数量累计），返回逐张接受状态与各采购单行
-剩余数量。
-
-另提供 `POST /v1/acknowledge`：接收单份 810 报文与回执控制号，返回
+剩余数量。另提供 `POST /v1/acknowledge`：接收单份 810 报文与回执控制号，返回
 ASC X12 004010 **997 功能回执**（Functional Acknowledgment）报文；对缺少 `SE`、
 `GS08` 非 `004010` 等可识别来报错误生成 `AK5`/`AK9` 为 `R`、接收数为 0 的拒绝回执。
 
@@ -45,6 +52,7 @@ docker compose up --build -d
 - 服务地址：`http://localhost:8080`
 - 核验接口：`POST http://localhost:8080/v1/verify`
 - 报文生成：`POST http://localhost:8080/v1/issue-810`
+- 批量拆分：`POST http://localhost:8080/v1/split-810`
 - 核销接口：`POST http://localhost:8080/v1/reconcile`
 - 回执生成：`POST http://localhost:8080/v1/acknowledge`
 - 回执状态解析：`POST http://localhost:8080/v1/ack-status`
@@ -202,6 +210,107 @@ curl -s http://localhost:8080/v1/issue-810 \
       {"it101": "2", "it102": "3",  "it104": "0.05"}
     ]
   }'
+```
+
+## 请求 / 响应（POST /v1/split-810）
+
+将一份**单交换（ISA/IEA）、单功能组（GS/GE）内含 1～50 个连续 ST…SE 交易集**
+的 ASC X12 004010 X12 810 交换报文拆分为多张**单张报文**，并逐张核验。
+
+请求体（JSON）：
+
+```json
+{
+  "edi_text": "ISA*00*          *00*          *...GS...ST*810*0001~...SE*5*0001~ST*810*0002~...GE*2*42~IEA*1*000000001~"
+}
+```
+
+`edi_text` 必须为纯 ASCII，大小不超过 **1 MiB（1048576 字节）**；报文结构固定为：
+
+```
+ISA → GS → (ST → BIG → IT1(1..100) → TDS → SE) × 1..50 → GE → IEA
+```
+
+成功 `200`，`invoices` **严格按原报文顺序**返回；每项含原 `ST02`、`BIG02`
+发票号与重建后的单张 `edi_text`：
+
+```json
+{
+  "invoices": [
+    {"set_index": 0, "st02": "0001", "invoice_number": "INV-1",
+     "edi_text": "ISA*...GE*1*42~IEA*1*000000001~"},
+    {"set_index": 1, "st02": "0002", "invoice_number": "INV-2",
+     "edi_text": "ISA*...GE*1*42~IEA*1*000000001~"}
+  ]
+}
+```
+
+- `set_index`：交易集在原报文中的序号（**从 0 开始**）。
+- 每张 `edi_text` 为独立的**单交换/单组/单交易集**报文：保留原业务段
+  （ST…SE 各段原文）与原控制号（ISA13/GS06/ST02 等），仅把 `SE01` 重写为
+  ST..SE 的实际段数、`GE01` 重写为 `1`（原批内错误的 `SE01` 不导致失败）；
+  分隔符沿用来报。每份均为纯 ASCII、**≤64 KiB**，可直接再提交 `/v1/verify`
+  （接口返回前已用与 `/v1/verify` 完全相同的规则逐张核验通过）。
+
+### 批量外壳规则
+
+1. **分隔符**：按 ISA 固定位置读取（字节偏移 3/104/105），规则同
+   `/v1/verify`；`ISA12 == "00401"`、`GS08 == "004010"`。
+2. **控制号配对**：`ISA13 == IEA02`、`GS06 == GE02`；每个交易集
+   `ST02 == SE02`。
+3. **计数**：`GE01` 必须**等于实际交易集数**（1～50），`IEA01 == 1`。
+4. **交易集**：各 `ST01 == "810"`，`ST02` 非空且在本批内**不重复**；
+   ST 与 SE 之间不允许再出现 ISA/GS/ST/GE/IEA 信封段。
+5. **逐张业务核验**：每个交易集重建后按 `/v1/verify` 规则核验
+   （BIG/IT1/TDS 金额合计、IT101 唯一、1～100 行等）。
+
+**任一外壳或业务核验失败，整批返回 `422`，不返回任何部分结果**。错误体带
+原报文内**从 1 开始的段序号** `seg`、段标识 `segment`、**交易集序号**
+`set_index`（从 0 开始；交换/组级错误如 `GE`/`IEA`/`ISA` 问题为 `null`）：
+
+```json
+{
+  "error": {
+    "code": "TDS_MISMATCH",
+    "message": "TDS01 总额 9999 分与各行金额之和 1275 分不一致",
+    "seg": 11,
+    "segment": "TDS",
+    "set_index": 1
+  }
+}
+```
+
+### split-810 错误码（422）
+
+| code | 含义 |
+| --- | --- |
+| `EMPTY_INPUT` / `NOT_ASCII` / `PAYLOAD_TOO_LARGE` | edi_text 为空 / 非 ASCII / 超过 1 MiB（逐张重建报文超 64 KiB 时同样为 `PAYLOAD_TOO_LARGE`，带 `set_index`） |
+| `ISA_*`、`INVALID_*SEPARATOR*`、`SEPARATOR_CONFLICT` | ISA 与分隔符错误（同 `/v1/verify`，`set_index` 为 `null`） |
+| `ISA12_BAD_VERSION` / `GS08_BAD_VERSION` / `ST01_NOT_810` | 版本或交易集类型不符 |
+| `UNEXPECTED_SEGMENT` / `EMPTY_SEGMENT` / `MISSING_SEGMENT` / `TRAILING_DATA` | 段顺序错误、空段、未正常闭合、IEA 后多余数据 |
+| `SEGMENT_TOO_FEW_ELEMENTS` | 段元素个数不足 |
+| `ST02_EMPTY` / `ST02_DUPLICATE` | ST02 为空 / 批内重复 |
+| `TS_MISSING` / `TS_TOO_MANY` | 交易集数为 0 / 超过 50 |
+| `SE01_INVALID` | SE01 不是非负整数（计数不符会在重建时自动修正，不报错） |
+| `GE01_INVALID` / `GE01_COUNT_MISMATCH` | GE01 非数字 / 不等于实际交易集数 |
+| `IEA01_INVALID` / `IEA01_NOT_ONE` | IEA01 非数字 / 不为 1 |
+| `ISA_IEA_CONTROL_MISMATCH` / `GS_GE_CONTROL_MISMATCH` / `ST_SE_CONTROL_MISMATCH` | 控制号配对不一致 |
+| （其余） | 逐张 `/v1/verify` 业务核验错误码（如 `BIG02_EMPTY`、`IT101_DUPLICATE`、`IT1_TOO_MANY`、`IT102_INVALID`、`TDS_MISMATCH` 等），`seg` 已回映为原报文段序号 |
+
+调用示例：
+
+```bash
+curl -s http://localhost:8080/v1/split-810 \
+  -H 'Content-Type: application/json' \
+  -d '{"edi_text": "ISA*00*          *00*          *ZZ*SENDER123456789*ZZ*RECEIVER1234567*000830*1200*U*00401*000000001*0*P*:~GS*IN*S*R*20200830*1200*42*X*004010~ST*810*0001~BIG*20200830*INV-1~IT1*1*2*EA*10.50~TDS*2100~SE*5*0001~ST*810*0002~BIG*20200830*INV-2~IT1*1*1*EA*19.99~TDS*1999~SE*5*0002~GE*2*42~IEA*1*000000001~"}'
+```
+
+返回的每份 `invoices[].edi_text` 可原样回传核验：
+
+```bash
+curl -s http://localhost:8080/v1/verify \
+  -H 'Content-Type: application/json' \
+  -d '{"edi_text": "<invoices[0].edi_text>"}'
 ```
 
 ## 请求 / 响应（POST /v1/reconcile）
@@ -643,12 +752,14 @@ pytest -q
 app/main.py        FastAPI 路由、请求/响应模型、422/409/404 异常处理
 app/verifier.py    ISA 分隔符解析、外壳状态机、整数定点金额核验
 app/issuer.py      结构化发票校验与 004010 X12 810 报文生成（固定 * : ~ 分隔符）
+app/splitter.py    单交换/单组多交易集拆分、外壳批量校验与单张报文重建核验
 app/reconciler.py  采购单校验与多发票逐张核销（整数毫单位，无浮点）
 app/acknowledger.py 外壳可回执性提取与 004010 X12 997 回执生成
 app/ack_status.py  发送清单校验与 004010 X12 997 回执状态解析（A/R/U 推断）
 app/inbox.py       收件键/业务指纹计算与 SQLite 幂等收件库
 tests/test_verify.py      /v1/verify 端到端/单元测试（39 个）
 tests/test_issue_810.py   /v1/issue-810 端到端测试（23 个）
+tests/test_split_810.py   /v1/split-810 端到端测试（33 个）
 tests/test_reconcile.py   /v1/reconcile 端到端测试（25 个）
 tests/test_acknowledge.py /v1/acknowledge 端到端测试（19 个）
 tests/test_ack_status.py  /v1/ack-status 端到端测试（48 个）
