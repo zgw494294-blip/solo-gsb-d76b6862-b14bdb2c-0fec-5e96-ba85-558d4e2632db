@@ -28,15 +28,17 @@ from .reconciler import (
     reconcile,
     validate_order_lines,
 )
+from .splitter import SplitError, split_batch
 from .verifier import Invoice, X12Error, verify_text
 
 app = FastAPI(
     title="X12 810 Invoice Verification API",
-    version="1.5.0",
+    version="1.6.0",
     description="核验 ASC X12 004010 单份 810 发票报文的外壳结构与发票金额，"
                 "由结构化发票数据生成 004010 X12 810 报文，"
                 "按采购单对多份发票逐张核销，对单份 810 生成 997 功能回执，"
                 "按发送清单解析 997 回执中各交易集的接受状态，"
+                "将单组内 1～50 张 810 的批量交换报文拆分为可逐张核验的单张报文，"
                 "并提供基于 SQLite 的幂等收件库（重发识别与冲突检测）。",
 )
 
@@ -78,6 +80,22 @@ async def order_error_handler(_request, exc: OrderError) -> JSONResponse:
     return JSONResponse(
         status_code=422,
         content={"error": {"code": exc.code, "message": exc.message}},
+    )
+
+
+@app.exception_handler(SplitError)
+async def split_error_handler(_request, exc: SplitError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "code": exc.code,
+                "message": exc.message,
+                "seg": exc.seg,
+                "segment": exc.segment,
+                "transaction_set": exc.transaction_set,
+            }
+        },
     )
 
 
@@ -130,6 +148,52 @@ async def verify_invoice(req: VerifyRequest) -> VerifyResponse:
             for line in invoice.lines
         ],
         total_amount=invoice.total_amount,
+    )
+
+
+# ---------- POST /v1/split-810 ----------
+
+
+class SplitRequest(BaseModel):
+    edi_text: str = Field(
+        ..., description="批量 X12 810 交换报文（ASCII，≤1 MiB；"
+                        "单 ISA/IEA、单 GS/GE，内含 1～50 个连续 ST…SE）")
+
+
+class SplitInvoiceOut(BaseModel):
+    index: int = Field(..., description="批内交易集序号（从 0 开始）")
+    st02: str = Field(..., description="ST02 交易集控制号（原文保留）")
+    invoice_number: str = Field(..., description="BIG02 发票号")
+    edi_text: str = Field(
+        ..., description="重建的单张 004010 X12 810 报文（GE01=1，"
+                         "可通过 /v1/verify，≤64 KiB）")
+
+
+class SplitResponse(BaseModel):
+    count: int = Field(..., description="拆分出的交易集数量（1～50）")
+    invoices: list[SplitInvoiceOut] = Field(
+        ..., description="按原报文顺序排列的各张发票结果")
+
+
+@app.post(
+    "/v1/split-810",
+    response_model=SplitResponse,
+    summary="拆分单组内 1～50 张 810 的批量交换报文并逐张核验",
+)
+async def split_810(req: SplitRequest) -> SplitResponse:
+    # 任一条失败由 split_batch 抛 SplitError -> 整批 422，不返回部分结果
+    invoices = split_batch(req.edi_text)
+    return SplitResponse(
+        count=len(invoices),
+        invoices=[
+            SplitInvoiceOut(
+                index=item.index,
+                st02=item.st02,
+                invoice_number=item.invoice_number,
+                edi_text=item.edi_text,
+            )
+            for item in invoices
+        ],
     )
 
 
