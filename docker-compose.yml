@@ -1,0 +1,18 @@
+services:
+  x12-verify:
+    build: .
+    image: x12-810-verify:latest
+    container_name: x12-810-verify
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    volumes:
+      - inbox-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  inbox-data:
